@@ -16,15 +16,16 @@ class Backtester:
         self.positions = []
         self.exchange = ccxt.binance({'enableRateLimit': True})
         
-        # Ajuste de parámetros para más oportunidades
+        # Ajuste de parámetros optimizados
         self.rsi_period = 14
-        self.rsi_oversold = 35        # Menos restrictivo
-        self.rsi_overbought = 65      # Menos restrictivo
-        self.stop_loss = 0.02         
-        self.take_profit = 0.035      
-        self.trailing_stop = 0.015    
-        self.max_trades_per_day = 3   # Aumentado para más oportunidades
-        self.min_profit_threshold = 0.008  # Reducido
+        self.rsi_oversold = 30
+        self.rsi_overbought = 70
+        self.stop_loss = 0.015        # Reducido para minimizar pérdidas máximas
+        self.take_profit = 0.03       # Ajustado en base al nuevo stop loss
+        self.trailing_stop = 0.012    # Más ajustado para asegurar ganancias
+        self.max_trades_per_day = 4   # Aumentado ligeramente
+        self.min_profit_threshold = 0.01
+        self.max_loss_per_day = 0.05  # Nuevo: límite de pérdida diaria
         
     def load_historical_data(self):
         """Carga datos históricos desde Binance"""
@@ -90,78 +91,93 @@ class Backtester:
     def check_entry_conditions(self, row, prev_row):
         score = 0
         
-        # Tendencia
-        if row['trend'] == 1:  # Tendencia alcista
-            score += 2
-            if row['close'] > row['SMA_20']:
+        # Validación de tendencia más estricta
+        if row['trend'] == 1:
+            if row['close'] > row['SMA_20'] and row['SMA_20'] > row['SMA_50']:
+                score += 3
+            elif row['close'] > row['SMA_20']:
                 score += 1
         
-        # RSI
+        # RSI con confirmación
         if row['RSI'] < self.rsi_oversold:
+            if prev_row['RSI'] <= row['RSI']:  # RSI comenzando a subir
+                score += 3
+            else:
+                score += 1
+        
+        # Volumen con más peso
+        if row['volume'] > row['volume_ma20'] * 1.2:  # 20% sobre la media
             score += 2
-        elif row['RSI'] < 45:
-            score += 1
         
-        # Momentum
-        if row['momentum'] > 0:
-            score += 1
+        # Volatilidad más específica
+        if 0.008 < row['volatility'] < 0.025:
+            score += 2
         
-        # Volumen
-        if row['volume'] > row['volume_ma20']:
-            score += 1
+        # MACD
+        if row['MACD'] > row['MACD_signal'] and prev_row['MACD'] <= prev_row['MACD_signal']:
+            score += 2
         
-        # Volatilidad favorable
-        if 0.005 < row['volatility'] < 0.03:
-            score += 1
-        
-        # Precio cerca de soporte
+        # Bollinger Bands
         if row['close'] < row['BB_lower'] * 1.01:
-            score += 2
+            if row['close'] > prev_row['close']:  # Rebote confirmado
+                score += 3
+            else:
+                score += 1
         
-        return score >= 5  # Menos restrictivo
+        return score >= 7  # Más exigente
 
     def check_exit_conditions(self, row, entry_price, position_time):
         profit_pct = (row['close'] - entry_price) / entry_price
         
-        # Trailing stop
-        trailing_stop_price = entry_price * (1 + profit_pct - self.trailing_stop)
+        # Trailing stop dinámico
+        trailing_stop = self.trailing_stop
+        if profit_pct > self.take_profit * 0.7:
+            trailing_stop = self.trailing_stop * 0.8  # Más ajustado cuando hay buenas ganancias
+        
+        trailing_stop_price = entry_price * (1 + profit_pct - trailing_stop)
         
         conditions = [
             # Stop loss dinámico
             row['close'] < trailing_stop_price and profit_pct > self.min_profit_threshold,
             
-            # Take profit con confirmación
+            # Take profit con múltiples confirmaciones
             profit_pct >= self.take_profit and (
-                row['RSI'] > self.rsi_overbought or
-                row['close'] > row['BB_upper']
+                (row['RSI'] > self.rsi_overbought) or
+                (row['close'] > row['BB_upper'] and row['volume'] < row['volume_ma20']) or
+                (row['MACD'] < row['MACD_signal'] and row['close'] > row['SMA_20'])
             ),
             
             # Stop loss fijo
             profit_pct <= -self.stop_loss,
             
-            # Señales técnicas de salida
-            row['MACD'] < row['MACD_signal'] and profit_pct > self.min_profit_threshold,
-            
-            # Tiempo máximo en posición
-            (row['timestamp'] - position_time) > timedelta(hours=6)
+            # Tiempo máximo reducido
+            (row['timestamp'] - position_time) > timedelta(hours=4)
         ]
         
         return any(conditions)
 
     def calculate_position_size(self, price, stop_loss_price):
-        """Cálculo de posición mejorado"""
-        risk_per_trade = self.balance * 0.02  # 2% riesgo por operación
+        """Cálculo de posición mejorado con gestión de riesgo adaptativa"""
+        # Riesgo base por operación
+        risk_per_trade = self.balance * 0.015  # Reducido a 1.5%
         
-        # Ajuste basado en volatilidad
+        # Ajuste por volatilidad
         volatility_factor = 1.0
         if hasattr(self, 'current_volatility'):
             if self.current_volatility > 0.02:
-                volatility_factor = 0.7
+                volatility_factor = 0.6
             elif self.current_volatility < 0.01:
-                volatility_factor = 1.2
+                volatility_factor = 1.1
         
-        position_size = (risk_per_trade * volatility_factor) / (price - stop_loss_price)
-        max_position = self.balance * 0.95 / price
+        # Ajuste por rendimiento reciente
+        if hasattr(self, 'recent_trades'):
+            recent_wins = sum(1 for t in self.recent_trades[-5:] if t > 0)
+            performance_factor = 0.8 + (recent_wins * 0.08)  # 0.8 a 1.2
+        else:
+            performance_factor = 1.0
+        
+        position_size = (risk_per_trade * volatility_factor * performance_factor) / (price - stop_loss_price)
+        max_position = self.balance * 0.8 / price  # Reducido a 80%
         
         return min(position_size, max_position)
 
