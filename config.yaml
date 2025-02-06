@@ -3,8 +3,8 @@ binance:
   api_secret: "RQHZrCocr8FrENmCMFj7PdNAyxGPdNT1XXQD19oc4KOIAdLEQ12bl4EL01uMuMgW"
 
 telegram:
-  token: "TU_TOKEN_DE_TELEGRAM"
-  chat_id: "TU_CHAT_ID"
+  token: "7833148217:AAGLH2-RAkd1RMo2dYWwGH2WBBr9EyZ96vI"
+  chat_id: "6800921"
 
 trading:
   initial_capital: 100
@@ -12,9 +12,5 @@ trading:
   daily_loss_limit: 0.05
   pairs:
     - "BTCUSDT"
-    - "ETHUSDT"
-    - "BNBUSDT"
-
-exchange:
-  api_key: "YOUR_EXCHANGE_API_KEY"
-  api_secret: "YOUR_EXCHANGE_API_SECRET"
+    # - "ETHUSDT"
+    # - "BNBUSDT"

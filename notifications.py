@@ -83,4 +83,12 @@ class NotificationSystem:
             f"P&L: ${total_profit:.2f}\n"
             f"Win Rate: {win_rate:.1f}%"
         )
-        await self.send_telegram(message) 
+        await self.send_telegram(message)
+    
+    async def close(self):
+        """Cierra las conexiones pendientes"""
+        try:
+            if hasattr(self, 'bot'):
+                await self.bot.close()
+        except Exception as e:
+            print(f"Error cerrando notificaciones: {e}") 
