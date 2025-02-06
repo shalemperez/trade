@@ -10,7 +10,7 @@ from risk_management import RiskManager
 from notifications import NotificationSystem
 import numpy as np
 import yaml
-import ccxt
+import ccxt.async_support as ccxt
 import signal
 import sys
 
@@ -26,140 +26,284 @@ class MultiPairTrader:
         base_allocation = self.total_budget / len(self.trading_pairs)
         return {pair: base_allocation for pair in self.trading_pairs}
 
+async def get_historical_data(exchange, symbol, timeframe):
+    """Obtiene datos históricos de Binance de forma asíncrona"""
+    try:
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                ohlcv = await exchange.fetch_ohlcv(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    limit=100
+                )
+                
+                if not ohlcv:
+                    print(f"No se obtuvieron datos para {symbol}")
+                    return None
+                    
+                df = pd.DataFrame(
+                    ohlcv,
+                    columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+                )
+                
+                if df.empty:
+                    print(f"DataFrame vacío para {symbol}")
+                    return None
+                
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                return df
+                
+            except ccxt.RateLimitExceeded:
+                if attempt < max_retries - 1:
+                    print(f"Rate limit alcanzado, reintentando en {retry_delay} segundos...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    raise
+            except Exception as e:
+                print(f"Error en intento {attempt + 1}: {str(e)}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                else:
+                    raise
+                    
+    except Exception as e:
+        print(f"Error obteniendo datos históricos para {symbol}: {str(e)}")
+        return None
+
 def add_technical_indicators(df):
-    """Añade indicadores técnicos consistentes con el backtester"""
+    """Añade indicadores técnicos al DataFrame"""
     df['RSI'] = RSIIndicator(close=df['close'], window=14).rsi()
     df['SMA_20'] = SMAIndicator(close=df['close'], window=20).sma_indicator()
     df['SMA_50'] = SMAIndicator(close=df['close'], window=50).sma_indicator()
     
-    # Bollinger Bands
     bollinger = BollingerBands(close=df['close'], window=20)
     df['BB_upper'] = bollinger.bollinger_hband()
     df['BB_middle'] = bollinger.bollinger_mavg()
     df['BB_lower'] = bollinger.bollinger_lband()
     
-    # MACD
     macd = MACD(close=df['close'])
     df['MACD'] = macd.macd()
     df['MACD_signal'] = macd.macd_signal()
     
-    # Volumen y volatilidad
     df['volume_ma20'] = df['volume'].rolling(window=20).mean()
     df['volatility'] = df['close'].pct_change().rolling(window=20).std()
-    
-    # Momentum y tendencia
     df['momentum'] = df['close'].pct_change(periods=10)
     df['trend'] = np.where(df['SMA_20'] > df['SMA_50'], 1, -1)
     
     return df
 
 def analyze_signals(data, backtester_params):
-    """Analiza señales usando los mismos criterios que el backtester"""
+    """Analiza señales de trading"""
     current_row = data.iloc[-1]
     prev_row = data.iloc[-2]
     
     score = 0
+    signals_info = []
     
-    # Tendencia
-    if current_row['trend'] == 1:  # Tendencia alcista
-        score += 2
+    # Análisis técnico
+    if current_row['trend'] == 1:
+        score += 1.5
+        signals_info.append("Tendencia alcista: +1.5")
         if current_row['close'] > current_row['SMA_20']:
             score += 1
+            signals_info.append("Precio sobre SMA20: +1")
     
-    # RSI
-    if current_row['RSI'] < backtester_params['rsi_oversold']:
-        score += 2
-    elif current_row['RSI'] < 45:
+    if 30 <= current_row['RSI'] <= 70:
         score += 1
+        signals_info.append("RSI en rango saludable: +1")
+    elif current_row['RSI'] < 30:
+        score += 2
+        signals_info.append("RSI en sobreventa: +2")
     
-    # Momentum
     if current_row['momentum'] > 0:
         score += 1
+        signals_info.append("Momentum positivo: +1")
     
-    # Volumen
-    if current_row['volume'] > current_row['volume_ma20']:
+    if current_row['volume'] > current_row['volume_ma20'] * 1.2:
+        score += 1.5
+        signals_info.append("Volumen alto: +1.5")
+    
+    if 0.001 < current_row['volatility'] < 0.05:
         score += 1
+        signals_info.append("Volatilidad favorable: +1")
     
-    # Volatilidad favorable
-    if 0.005 < current_row['volatility'] < 0.03:
-        score += 1
-    
-    # Precio cerca de soporte
-    if current_row['close'] < current_row['BB_lower'] * 1.01:
+    if current_row['close'] < current_row['BB_lower'] * 1.02:
         score += 2
-        
-    should_trade = score >= 7
+        signals_info.append("Precio cerca del soporte: +2")
+    
+    if prev_row['SMA_20'] <= prev_row['SMA_50'] and current_row['SMA_20'] > current_row['SMA_50']:
+        score += 1.5
+        signals_info.append("Cruce alcista de medias: +1.5")
+    
+    should_trade = score >= 5
+    
+    print("\nAnálisis detallado de señales:")
+    for signal in signals_info:
+        print(f"• {signal}")
+    print(f"Score total: {score:.1f}")
     
     return {
         'should_trade': should_trade,
         'entry_price': current_row['close'],
         'stop_loss': current_row['close'] * (1 - backtester_params['stop_loss']),
         'take_profit': current_row['close'] * (1 + backtester_params['take_profit']),
-        'score': score
+        'score': score,
+        'signals': signals_info
     }
 
 async def execute_trade(pair, position_size, signals, exchange):
-    """Ejecuta la operación con parámetros consistentes"""
+    """Ejecuta operaciones de trading"""
     try:
-        order = exchange.create_order(
-            symbol=pair,
-            type='market',
-            side='buy',
-            amount=position_size,
-            params={
-                'stopLoss': {
-                    'price': signals['stop_loss'],
-                    'type': 'trailing',
-                    'trailingPercent': 1.2  # 1.2%
-                },
-                'takeProfit': {
-                    'price': signals['take_profit']
-                }
-            }
-        )
-        return True, order
-    except Exception as e:
-        print(f"Error al ejecutar trade: {e}")
-        return False, None
-
-def get_historical_data(symbol, timeframe):
-    """Obtiene datos históricos de Binance"""
-    try:
-        # Cargar configuración
-        with open('config.yaml', 'r') as file:
-            config = yaml.safe_load(file)
+        # Verificar balance
+        balance = await exchange.fetch_balance()
+        quote_currency = pair.split('/')[-1]  # BTCUSDT -> USDT
         
-        # Configurar cliente de Binance
-        exchange = ccxt.binance({
-            'apiKey': config['binance']['api_key'],
-            'secret': config['binance']['api_secret'],
-            'enableRateLimit': True
-        })
-        
-        # Obtener datos (método síncrono)
-        ohlcv = exchange.fetch_ohlcv(
-            symbol=symbol,
-            timeframe=timeframe,
-            limit=100
-        )
-        
-        if not ohlcv:
-            return None
+        if quote_currency not in balance or 'free' not in balance[quote_currency]:
+            print(f"No se pudo obtener el balance de {quote_currency}")
+            return False, None
             
-        # Convertir a DataFrame
-        df = pd.DataFrame(
-            ohlcv,
-            columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-        )
+        available_balance = float(balance[quote_currency]['free'])
+        required_amount = position_size * signals['entry_price']
         
-        # Convertir timestamp
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        # Formatear números para mejor legibilidad
+        formatted_required = f"{required_amount:.2f}"
+        formatted_available = f"{available_balance:.2f}"
         
-        return df
+        print("\nVerificación de balance:")
+        print(f"Balance disponible en {quote_currency}: ${formatted_available}")
+        print(f"Cantidad requerida: ${formatted_required}")
         
+        if required_amount > available_balance:
+            print(f"\n❌ Balance insuficiente:")
+            print(f"• Necesario: ${formatted_required} {quote_currency}")
+            print(f"• Disponible: ${formatted_available} {quote_currency}")
+            print(f"• Faltante: ${(required_amount - available_balance):.2f} {quote_currency}")
+            return False, None
+            
+        # Obtener información del mercado
+        markets = exchange.markets
+        if pair not in markets:
+            print(f"Par {pair} no encontrado en el mercado")
+            return False, None
+            
+        market = markets[pair]
+        
+        # Obtener precisión del mercado
+        amount_precision = market['precision']['amount'] if 'amount' in market['precision'] else 8
+        price_precision = market['precision']['price'] if 'price' in market['precision'] else 8
+        
+        # Aplicar límites del mercado
+        min_amount = float(market['limits']['amount']['min']) if 'amount' in market['limits'] else 0
+        if position_size < min_amount:
+            print(f"\n❌ Tamaño de posición muy pequeño:")
+            print(f"• Tamaño calculado: {position_size}")
+            print(f"• Mínimo permitido: {min_amount}")
+            return False, None
+        
+        # Redondear cantidades
+        position_size = round(position_size, amount_precision)
+        stop_loss_price = round(signals['stop_loss'], price_precision)
+        take_profit_price = round(signals['take_profit'], price_precision)
+        
+        print(f"\n📊 Detalles de la orden:")
+        print(f"• Par: {pair}")
+        print(f"• Tamaño: {position_size}")
+        print(f"• Precio estimado: ${signals['entry_price']:.2f}")
+        print(f"• Stop loss: ${stop_loss_price:.2f}")
+        print(f"• Take profit: ${take_profit_price:.2f}")
+        
+        try:
+            # Crear orden de mercado
+            order = await exchange.create_order(
+                symbol=pair,
+                type='market',
+                side='buy',
+                amount=position_size
+            )
+            
+            print("Orden de mercado creada:", order['id'])
+            
+            # Esperar a que se llene la orden
+            filled = False
+            max_wait = 10  # segundos máximos de espera
+            start_time = time.time()
+            
+            while not filled and time.time() - start_time < max_wait:
+                try:
+                    filled_order = await exchange.fetch_order(order['id'], pair)
+                    if filled_order['status'] == 'closed':
+                        filled = True
+                        break
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    print(f"Error verificando orden: {e}")
+                    await asyncio.sleep(1)
+            
+            if not filled:
+                print("Tiempo de espera agotado para la orden principal")
+                return False, None
+            
+            # Crear órdenes OCO (One-Cancels-the-Other) si está disponible
+            try:
+                oco_order = await exchange.create_order(
+                    symbol=pair,
+                    type='oco',
+                    side='sell',
+                    amount=position_size,
+                    price=take_profit_price,
+                    stopPrice=stop_loss_price,
+                    stopLimitPrice=stop_loss_price
+                )
+                print("Orden OCO creada exitosamente")
+                return True, {
+                    'main_order': order,
+                    'oco_order': oco_order
+                }
+            except Exception as e:
+                print(f"Error creando orden OCO, intentando crear órdenes separadas: {e}")
+                
+                # Crear órdenes separadas si OCO falla
+                stop_loss_order = await exchange.create_order(
+                    symbol=pair,
+                    type='stop_loss_limit',
+                    side='sell',
+                    amount=position_size,
+                    price=stop_loss_price,
+                    params={
+                        'stopPrice': stop_loss_price
+                    }
+                )
+                
+                take_profit_order = await exchange.create_order(
+                    symbol=pair,
+                    type='limit',
+                    side='sell',
+                    amount=position_size,
+                    price=take_profit_price
+                )
+                
+                print("Órdenes creadas exitosamente:")
+                print(f"Orden principal: {order['id']}")
+                print(f"Stop Loss: {stop_loss_order['id']}")
+                print(f"Take Profit: {take_profit_order['id']}")
+                
+                return True, {
+                    'main_order': order,
+                    'stop_loss': stop_loss_order,
+                    'take_profit': take_profit_order
+                }
+                
+        except Exception as e:
+            print(f"Error creando órdenes: {str(e)}")
+            return False, None
+            
     except Exception as e:
-        print(f"Error obteniendo datos históricos: {e}")
-        return None
+        print(f"Error al ejecutar trade: {str(e)}")
+        return False, None
 
 class GracefulExit(SystemExit):
     pass
@@ -179,6 +323,7 @@ async def shutdown(signal, loop):
     loop.stop()
 
 async def main():
+    exchange = None
     try:
         with open('config.yaml', 'r') as file:
             config = yaml.safe_load(file)
@@ -191,18 +336,29 @@ async def main():
             'options': {
                 'defaultType': 'spot',
                 'adjustForTimeDifference': True,
-                'createMarketBuyOrderRequiresPrice': False
+                'createMarketBuyOrderRequiresPrice': False,
+                'warnOnFetchOHLCVLimitArgument': False,
+                'recvWindow': 60000
             }
         })
         
-        # Verificar conexión con el exchange
-        try:
-            exchange.load_markets()
-            print("Conexión exitosa con Binance")
-        except Exception as e:
-            print(f"Error conectando con Binance: {e}")
-            return
-
+        # Cargar mercados
+        await exchange.load_markets()
+        print("Conexión exitosa con Binance")
+        
+        # Verificar balance inicial
+        balance = await exchange.fetch_balance()
+        print("\n💰 Balance inicial:")
+        for currency in ['USDT', 'BTC', 'ETH', 'BNB']:
+            if currency in balance and 'free' in balance[currency]:
+                free_amount = float(balance[currency]['free'])
+                used_amount = float(balance[currency]['used'])
+                total_amount = float(balance[currency]['total'])
+                print(f"• {currency}:")
+                print(f"  - Disponible: {free_amount:.8f}")
+                print(f"  - En uso: {used_amount:.8f}")
+                print(f"  - Total: {total_amount:.8f}")
+        
         # Inicializar componentes
         risk_manager = RiskManager(
             initial_capital=config['trading']['initial_capital'],
@@ -215,16 +371,13 @@ async def main():
             telegram_chat_id=config['telegram']['chat_id']
         )
         
-        # Enviar mensaje de inicio
         await notifier.send_telegram("🚀 Bot de trading iniciado")
         
-        # Configurar pares de trading desde config.yaml
         trading_pairs = config['trading']['pairs']
-        trader = MultiPairTrader(trading_pairs, total_budget=config['trading']['initial_capital'])
+        trader = MultiPairTrader(trading_pairs, config['trading']['initial_capital'])
         
         print(f"Monitoreando pares: {trading_pairs}")
         
-        # Parámetros consistentes con el backtester
         backtester_params = {
             'rsi_period': 14,
             'rsi_oversold': 30,
@@ -236,123 +389,81 @@ async def main():
             'min_profit_threshold': 0.01
         }
         
-        # Ejecutar backtesting primero para validar estrategia
-        backtester = Backtester(
-            symbol="BTC/USDT",
-            start_date=datetime.now() - timedelta(days=30),
-            end_date=datetime.now(),
-            initial_balance=1000
-        )
-        
-        df = backtester.load_historical_data()
-        if df is not None:
-            df = backtester.add_indicators(df)
-            trades = backtester.run_backtest(df)
-            
-            # Validar resultados antes de trading en vivo
-            if len(trades) > 0:
-                print("\nResultados del Backtesting más reciente:")
-                # Imprimir resultados directamente desde el backtester
-                backtester.print_backtest_results(
-                    backtester.initial_balance,
-                    backtester.balance,
-                    trades
-                )
-        
-        # Variables para tracking
         trades = []
-        total_profit = 0
-        win_rate = 0
         daily_trades = {pair: 0 for pair in trading_pairs}
-        last_trade_date = datetime.now().date()
         
         while True:
-            try:
-                current_date = datetime.now().date()
-                
-                for pair in trading_pairs:
-                    try:
-                        # Obtener precio actual
-                        ticker = exchange.fetch_ticker(pair)
-                        current_price = ticker['last']
-                        print(f"Precio actual de {pair}: ${current_price:.2f}")
-                        
-                        if daily_trades[pair] >= backtester_params['max_trades_per_day']:
-                            print(f"Límite diario alcanzado para {pair}")
-                            continue
-                        
-                        data = get_historical_data(pair, "15m")
-                        if data is None:
-                            continue
-                        
-                        data = add_technical_indicators(data)
-                        signals = analyze_signals(data, backtester_params)
-                        
-                        print(f"Análisis de {pair}:")
-                        print(f"Score: {signals['score']}")
-                        print(f"Should trade: {signals['should_trade']}")
-                        
-                        if signals['should_trade'] and risk_manager.can_trade():
-                            print(f"¡Señal de trading detectada para {pair}!")
-                            
-                            position_size = risk_manager.calculate_position_size(
-                                signals['entry_price'],
-                                signals['stop_loss']
-                            )
-                            
-                            print(f"Intentando ejecutar orden de compra:")
-                            print(f"Tamaño: {position_size}")
-                            print(f"Precio entrada: {signals['entry_price']}")
-                            print(f"Stop loss: {signals['stop_loss']}")
-                            print(f"Take profit: {signals['take_profit']}")
-                            
-                            success, order = await execute_trade(
-                                pair, 
-                                position_size, 
-                                signals, 
-                                exchange
-                            )
-                            
-                            if success:
-                                print(f"¡Orden ejecutada exitosamente!")
-                                daily_trades[pair] += 1
-                                trades.append(order)
-                                
-                                await notifier.send_trade_notification(
-                                    "BUY",
-                                    pair,
-                                    signals['entry_price'],
-                                    position_size,
-                                    signals['stop_loss'],
-                                    signals['take_profit']
-                                )
-                            else:
-                                print(f"Error ejecutando la orden")
-                        
-                    except Exception as e:
-                        error_msg = f"Error procesando {pair}: {str(e)}"
-                        print(error_msg)
-                        await notifier.send_error(error_msg)
+            for pair in trading_pairs:
+                try:
+                    ticker = await exchange.fetch_ticker(pair)
+                    if not ticker or 'last' not in ticker:
+                        print(f"Datos de ticker inválidos para {pair}")
                         continue
-                
-                print("\nEsperando 60 segundos antes del próximo ciclo...")
-                await asyncio.sleep(60)
-                
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                error_msg = f"Error en el ciclo principal: {str(e)}"
-                print(error_msg)
-                if 'notifier' in locals():
+                        
+                    current_price = ticker['last']
+                    print(f"Precio actual de {pair}: ${current_price:.2f}")
+                    
+                    if daily_trades[pair] >= backtester_params['max_trades_per_day']:
+                        print(f"Límite diario alcanzado para {pair}")
+                        continue
+                    
+                    data = await get_historical_data(exchange, pair, "15m")
+                    if data is None:
+                        continue
+                    
+                    data = add_technical_indicators(data)
+                    signals = analyze_signals(data, backtester_params)
+                    
+                    if signals['should_trade'] and risk_manager.can_trade():
+                        print(f"¡Señal de trading detectada para {pair}!")
+                        
+                        position_size = risk_manager.calculate_position_size(
+                            signals['entry_price'],
+                            signals['stop_loss']
+                        )
+                        
+                        success, order = await execute_trade(
+                            pair,
+                            position_size,
+                            signals,
+                            exchange
+                        )
+                        
+                        if success:
+                            print(f"¡Orden ejecutada exitosamente!")
+                            daily_trades[pair] += 1
+                            trades.append(order)
+                            
+                            await notifier.send_trade_notification(
+                                "BUY",
+                                pair,
+                                signals['entry_price'],
+                                position_size,
+                                signals['stop_loss'],
+                                signals['take_profit']
+                            )
+                    
+                except Exception as e:
+                    error_msg = f"Error procesando {pair}: {str(e)}"
+                    print(error_msg)
                     await notifier.send_error(error_msg)
-                await asyncio.sleep(60)
+                    continue
+            
+            print("\nEsperando 60 segundos antes del próximo ciclo...")
+            await asyncio.sleep(60)
+            
+    except Exception as e:
+        print(f"Error en el ciclo principal: {str(e)}")
+        if 'notifier' in locals():
+            await notifier.send_error(str(e))
     
     finally:
-        # Cleanup
-        print("\nGuardando estado y cerrando conexiones...")
+        print("\nCerrando conexiones...")
         if 'notifier' in locals():
             await notifier.send_telegram("⚠️ Bot de trading finalizando...")
             await notifier.close()
+        if exchange:
+            await exchange.close()
 
 if __name__ == "__main__":
     try:
