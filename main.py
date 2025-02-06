@@ -180,7 +180,6 @@ async def shutdown(signal, loop):
 
 async def main():
     try:
-        # Cargar configuración
         with open('config.yaml', 'r') as file:
             config = yaml.safe_load(file)
         
@@ -190,7 +189,7 @@ async def main():
             'secret': config['binance']['api_secret'],
             'enableRateLimit': True,
             'options': {
-                'defaultType': 'future',
+                'defaultType': 'spot',
                 'adjustForTimeDifference': True,
                 'createMarketBuyOrderRequiresPrice': False
             }
@@ -219,9 +218,11 @@ async def main():
         # Enviar mensaje de inicio
         await notifier.send_telegram("🚀 Bot de trading iniciado")
         
-        # Configurar pares de trading
-        trading_pairs = ["BTC/USDT", "ETH/USDT", "BNB/USDT"]
-        trader = MultiPairTrader(trading_pairs, total_budget=1000)
+        # Configurar pares de trading desde config.yaml
+        trading_pairs = config['trading']['pairs']
+        trader = MultiPairTrader(trading_pairs, total_budget=config['trading']['initial_capital'])
+        
+        print(f"Monitoreando pares: {trading_pairs}")
         
         # Parámetros consistentes con el backtester
         backtester_params = {
@@ -258,34 +259,26 @@ async def main():
                     trades
                 )
         
-        # Iniciar trading en vivo
-        daily_trades = {pair: 0 for pair in trading_pairs}
-        last_trade_date = datetime.now().date()
-        
         # Variables para tracking
         trades = []
         total_profit = 0
         win_rate = 0
+        daily_trades = {pair: 0 for pair in trading_pairs}
+        last_trade_date = datetime.now().date()
         
         while True:
             try:
                 current_date = datetime.now().date()
                 
-                # Resetear contadores diarios
-                if current_date != last_trade_date:
-                    daily_trades = {pair: 0 for pair in trading_pairs}
-                    last_trade_date = current_date
-                    if trades:  # Solo enviar resumen si hay trades
-                        await notifier.send_daily_summary(trades, total_profit, win_rate)
-                
                 for pair in trading_pairs:
                     try:
-                        # Verificar si el mercado está activo
+                        # Obtener precio actual
                         ticker = exchange.fetch_ticker(pair)
-                        if not ticker:
-                            continue
-                            
+                        current_price = ticker['last']
+                        print(f"Precio actual de {pair}: ${current_price:.2f}")
+                        
                         if daily_trades[pair] >= backtester_params['max_trades_per_day']:
+                            print(f"Límite diario alcanzado para {pair}")
                             continue
                         
                         data = get_historical_data(pair, "15m")
@@ -295,14 +288,24 @@ async def main():
                         data = add_technical_indicators(data)
                         signals = analyze_signals(data, backtester_params)
                         
+                        print(f"Análisis de {pair}:")
+                        print(f"Score: {signals['score']}")
+                        print(f"Should trade: {signals['should_trade']}")
+                        
                         if signals['should_trade'] and risk_manager.can_trade():
-                            # Calcular tamaño de posición
+                            print(f"¡Señal de trading detectada para {pair}!")
+                            
                             position_size = risk_manager.calculate_position_size(
                                 signals['entry_price'],
                                 signals['stop_loss']
                             )
                             
-                            # Ejecutar trade
+                            print(f"Intentando ejecutar orden de compra:")
+                            print(f"Tamaño: {position_size}")
+                            print(f"Precio entrada: {signals['entry_price']}")
+                            print(f"Stop loss: {signals['stop_loss']}")
+                            print(f"Take profit: {signals['take_profit']}")
+                            
                             success, order = await execute_trade(
                                 pair, 
                                 position_size, 
@@ -311,14 +314,9 @@ async def main():
                             )
                             
                             if success:
+                                print(f"¡Orden ejecutada exitosamente!")
                                 daily_trades[pair] += 1
                                 trades.append(order)
-                                
-                                # Actualizar métricas
-                                if 'info' in order and 'realizedPnl' in order['info']:
-                                    pnl = float(order['info']['realizedPnl'])
-                                    total_profit += pnl
-                                    win_rate = (sum(1 for t in trades if float(t['info'].get('realizedPnl', 0)) > 0) / len(trades)) * 100
                                 
                                 await notifier.send_trade_notification(
                                     "BUY",
@@ -328,13 +326,16 @@ async def main():
                                     signals['stop_loss'],
                                     signals['take_profit']
                                 )
-                                
+                            else:
+                                print(f"Error ejecutando la orden")
+                        
                     except Exception as e:
                         error_msg = f"Error procesando {pair}: {str(e)}"
                         print(error_msg)
                         await notifier.send_error(error_msg)
                         continue
                 
+                print("\nEsperando 60 segundos antes del próximo ciclo...")
                 await asyncio.sleep(60)
                 
             except asyncio.CancelledError:
