@@ -235,38 +235,44 @@ class Backtester:
         
         return trades
 
-def analyze_results(trades):
-    if not trades:
-        return
+    def print_backtest_results(self, initial_balance, final_balance, trades):
+        """Imprime los resultados del backtesting"""
+        print("\nResultados del Backtesting:")
+        print(f"Balance Inicial: ${initial_balance:.2f}")
+        print(f"Balance Final: ${final_balance:.2f}")
+        print(f"Retorno: {((final_balance - initial_balance) / initial_balance * 100):.2f}%")
+        print(f"Número de operaciones: {len([t for t in trades if t['type'] == 'BUY'])}")
         
-    profits = [t['profit'] for t in trades if 'profit' in t]
-    win_trades = len([p for p in profits if p > 0])
-    loss_trades = len([p for p in profits if p < 0])
-    
-    print("\nAnálisis Detallado:")
-    print(f"Win Rate: {(win_trades / len(profits) * 100):.2f}%")
-    print(f"Profit Factor: {abs(sum([p for p in profits if p > 0]) / sum([p for p in profits if p < 0])):.2f}")
-    print(f"Máxima Ganancia: ${max(profits):.2f}")
-    print(f"Máxima Pérdida: ${min(profits):.2f}")
-    print(f"Promedio de Ganancia: ${np.mean([p for p in profits if p > 0]):.2f}")
-    print(f"Promedio de Pérdida: ${np.mean([p for p in profits if p < 0]):.2f}")
+        if trades:
+            print("\nÚltimas 10 operaciones:")
+            for trade in trades[-10:]:
+                print(f"Tipo: {trade['type']}, "
+                      f"Precio: ${trade['price']:.2f}, "
+                      f"Balance: ${trade['balance']:.2f}, "
+                      f"Timestamp: {trade['timestamp']}")
+        
+        self.analyze_results(trades)
 
-def print_backtest_results(initial_balance, final_balance, trades):
-    print("\nResultados del Backtesting:")
-    print(f"Balance Inicial: ${initial_balance:.2f}")
-    print(f"Balance Final: ${final_balance:.2f}")
-    print(f"Retorno: {((final_balance - initial_balance) / initial_balance * 100):.2f}%")
-    print(f"Número de operaciones: {len([t for t in trades if t['type'] == 'BUY'])}")
-    
-    if trades:
-        print("\nÚltimas 10 operaciones:")
-        for trade in trades[-10:]:
-            print(f"Tipo: {trade['type']}, "
-                  f"Precio: ${trade['price']:.2f}, "
-                  f"Balance: ${trade['balance']:.2f}, "
-                  f"Timestamp: {trade['timestamp']}")
-    
-    analyze_results(trades)
+    def analyze_results(self, trades):
+        """Analiza los resultados del backtesting"""
+        if not trades:
+            return
+        
+        profits = [t['profit'] for t in trades if 'profit' in t]
+        win_trades = len([p for p in profits if p > 0])
+        loss_trades = len([p for p in profits if p < 0])
+        
+        print("\nAnálisis Detallado:")
+        print(f"Win Rate: {(win_trades / len(profits) * 100):.2f}%")
+        if loss_trades > 0:  # Evitar división por cero
+            profit_factor = abs(sum([p for p in profits if p > 0]) / sum([p for p in profits if p < 0]))
+            print(f"Profit Factor: {profit_factor:.2f}")
+        print(f"Máxima Ganancia: ${max(profits):.2f}")
+        print(f"Máxima Pérdida: ${min(profits):.2f}")
+        if win_trades > 0:
+            print(f"Promedio de Ganancia: ${np.mean([p for p in profits if p > 0]):.2f}")
+        if loss_trades > 0:
+            print(f"Promedio de Pérdida: ${np.mean([p for p in profits if p < 0]):.2f}")
 
 if __name__ == "__main__":
     end_date = datetime.now()
@@ -284,4 +290,4 @@ if __name__ == "__main__":
     if df is not None:
         df = backtester.add_indicators(df)
         trades = backtester.run_backtest(df)
-        print_backtest_results(backtester.initial_balance, backtester.balance, trades) 
+        backtester.print_backtest_results(backtester.initial_balance, backtester.balance, trades) 

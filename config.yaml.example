@@ -1,0 +1,20 @@
+binance:
+  api_key: "YOUR_BINANCE_API_KEY"
+  api_secret: "YOUR_BINANCE_API_SECRET"
+
+telegram:
+  token: "YOUR_TELEGRAM_BOT_TOKEN"
+  chat_id: "YOUR_TELEGRAM_CHAT_ID"
+
+trading:
+  initial_capital: 100
+  risk_per_trade: 0.015
+  daily_loss_limit: 0.05
+  pairs:
+    - "BTCUSDT"
+    - "ETHUSDT"
+    - "BNBUSDT"
+
+exchange:
+  api_key: "YOUR_EXCHANGE_API_KEY"
+  api_secret: "YOUR_EXCHANGE_API_SECRET" 
