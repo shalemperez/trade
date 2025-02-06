@@ -16,39 +16,52 @@ class Backtester:
         self.positions = []
         self.exchange = ccxt.binance({'enableRateLimit': True})
         
-        # Ajuste de parámetros optimizados
+        # Ajuste de parámetros para más oportunidades
         self.rsi_period = 14
-        self.rsi_oversold = 30        # Más conservador para entradas
-        self.rsi_overbought = 70      # Más conservador para salidas
-        self.stop_loss = 0.02         # Aumentado para dar más espacio
-        self.take_profit = 0.04       # Aumentado para mejor ratio riesgo/beneficio
-        self.max_trades_per_day = 3   # Reducido para ser más selectivo
-        self.min_profit_threshold = 0.01  # Aumentado a 1%
-        self.trailing_stop = 0.015    # Nuevo: trailing stop del 1.5%
+        self.rsi_oversold = 35        # Menos restrictivo
+        self.rsi_overbought = 65      # Menos restrictivo
+        self.stop_loss = 0.02         
+        self.take_profit = 0.035      
+        self.trailing_stop = 0.015    
+        self.max_trades_per_day = 3   # Aumentado para más oportunidades
+        self.min_profit_threshold = 0.008  # Reducido
         
     def load_historical_data(self):
+        """Carga datos históricos desde Binance"""
         try:
             since = int(self.start_date.timestamp() * 1000)
-            until = int(self.end_date.timestamp() * 1000)
             
+            # Obtener datos históricos
             ohlcv = self.exchange.fetch_ohlcv(
                 symbol=self.symbol,
-                timeframe='15m',
+                timeframe='15m',  # Timeframe de 15 minutos
                 since=since,
-                limit=2000  # Aumentado para más datos
+                limit=2000  # Más datos
             )
             
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            if not ohlcv:
+                print("No se pudieron obtener datos históricos")
+                return None
+                
+            df = pd.DataFrame(
+                ohlcv,
+                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            )
+            
+            # Convertir timestamp a datetime
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df['returns'] = df['close'].pct_change()
+            
+            # Verificar que tenemos suficientes datos
+            print(f"Datos cargados: {len(df)} velas")
+            
             return df
             
         except Exception as e:
-            print(f"Error al obtener datos históricos: {e}")
+            print(f"Error al cargar datos históricos: {e}")
             return None
 
     def add_indicators(self, df):
-        # Indicadores existentes mejorados
+        # Indicadores básicos
         df['RSI'] = RSIIndicator(close=df['close'], window=self.rsi_period).rsi()
         df['SMA_20'] = SMAIndicator(close=df['close'], window=20).sma_indicator()
         df['SMA_50'] = SMAIndicator(close=df['close'], window=50).sma_indicator()
@@ -59,51 +72,53 @@ class Backtester:
         df['BB_middle'] = bollinger.bollinger_mavg()
         df['BB_lower'] = bollinger.bollinger_lband()
         
-        # Nuevos indicadores
+        # MACD
         macd = MACD(close=df['close'])
         df['MACD'] = macd.macd()
         df['MACD_signal'] = macd.macd_signal()
         
-        # Volatilidad
-        df['volatility'] = df['returns'].rolling(window=20).std()
+        # Volumen y volatilidad
+        df['volume_ma20'] = df['volume'].rolling(window=20).mean()
+        df['volatility'] = df['close'].pct_change().rolling(window=20).std()
         
-        # Tendencia
+        # Momentum y tendencia
+        df['momentum'] = df['close'].pct_change(periods=10)
         df['trend'] = np.where(df['SMA_20'] > df['SMA_50'], 1, -1)
         
         return df
 
     def check_entry_conditions(self, row, prev_row):
-        # Sistema de puntuación mejorado
         score = 0
         
-        # Condiciones de tendencia (peso mayor)
-        if row['SMA_20'] > row['SMA_50']:
-            score += 3
-        if row['close'] > row['SMA_20']:
+        # Tendencia
+        if row['trend'] == 1:  # Tendencia alcista
             score += 2
-            
-        # RSI con confirmación
-        if row['RSI'] < self.rsi_oversold:
-            score += 3
-        elif row['RSI'] < 40 and row['RSI'] > prev_row['RSI']:
-            score += 1
-            
-        # Bollinger Bands con confirmación de volumen
-        if row['close'] < row['BB_lower']:
-            if row['volume'] > prev_row['volume'] * 1.2:  # Confirmación de volumen
-                score += 3
-            else:
+            if row['close'] > row['SMA_20']:
                 score += 1
-                
-        # MACD
-        if row['MACD'] > row['MACD_signal'] and prev_row['MACD'] <= prev_row['MACD_signal']:
+        
+        # RSI
+        if row['RSI'] < self.rsi_oversold:
             score += 2
-            
-        # Volatilidad favorable
-        if row['volatility'] < 0.015:  # Baja volatilidad
+        elif row['RSI'] < 45:
             score += 1
-            
-        return score >= 8  # Más exigente con las entradas
+        
+        # Momentum
+        if row['momentum'] > 0:
+            score += 1
+        
+        # Volumen
+        if row['volume'] > row['volume_ma20']:
+            score += 1
+        
+        # Volatilidad favorable
+        if 0.005 < row['volatility'] < 0.03:
+            score += 1
+        
+        # Precio cerca de soporte
+        if row['close'] < row['BB_lower'] * 1.01:
+            score += 2
+        
+        return score >= 5  # Menos restrictivo
 
     def check_exit_conditions(self, row, entry_price, position_time):
         profit_pct = (row['close'] - entry_price) / entry_price
@@ -133,11 +148,22 @@ class Backtester:
         
         return any(conditions)
 
-    def calculate_position_size(self, price):
-        """Calcula el tamaño de la posición basado en gestión de riesgo"""
+    def calculate_position_size(self, price, stop_loss_price):
+        """Cálculo de posición mejorado"""
         risk_per_trade = self.balance * 0.02  # 2% riesgo por operación
-        position_size = risk_per_trade / (price * self.stop_loss)
-        return min(position_size, self.balance * 0.95 / price)  # Máximo 95% del balance
+        
+        # Ajuste basado en volatilidad
+        volatility_factor = 1.0
+        if hasattr(self, 'current_volatility'):
+            if self.current_volatility > 0.02:
+                volatility_factor = 0.7
+            elif self.current_volatility < 0.01:
+                volatility_factor = 1.2
+        
+        position_size = (risk_per_trade * volatility_factor) / (price - stop_loss_price)
+        max_position = self.balance * 0.95 / price
+        
+        return min(position_size, max_position)
 
     def run_backtest(self, df):
         in_position = False
@@ -150,12 +176,14 @@ class Backtester:
         for i in range(1, len(df)):
             current_row = df.iloc[i]
             prev_row = df.iloc[i-1]
-            current_date = current_row['timestamp'].date()
+            
+            # Actualizar volatilidad actual
+            self.current_volatility = current_row['volatility']
             
             # Resetear contador diario
-            if last_trade_date != current_date:
+            if last_trade_date != current_row['timestamp'].date():
                 daily_trades = 0
-                last_trade_date = current_date
+                last_trade_date = current_row['timestamp'].date()
             
             if daily_trades >= self.max_trades_per_day:
                 continue
@@ -165,7 +193,7 @@ class Backtester:
                     entry_price = current_row['close']
                     in_position = True
                     position_time = current_row['timestamp']
-                    position_size = self.calculate_position_size(entry_price)  # Nuevo cálculo
+                    position_size = self.calculate_position_size(entry_price, current_row['BB_lower'])  # Nuevo cálculo
                     daily_trades += 1
                     
                     trades.append({
