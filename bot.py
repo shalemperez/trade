@@ -1,50 +1,123 @@
 """
-Binance Crypto Trading Bot Based on RSI Crossover
+BTC-USDT RSI Live Trading Bot (Binance)
 
-This creates a crypto trading bot that buys BTC and ETH when RSI is less than 30 and sells
-when RSI is greater than 70. Easily backtest and take this live by changing a few
-lines of code.
+Strategy:
+- RSI < 28 → buy 25% of available USDT
+- RSI > 72 → sell all BTC
+- Stop-loss at 5% below entry price
+- Checks every 1 hour
 
-For more information on the blankly package, check out https://docs.blankly.finance
-
-Happy Building :D 
-
-NOTE: Make sure you properly set your binance_tld in the `settings.json`
-NOTE: Set use_sandbox = False since you will want to use Binance Live Data
+Run backtest first:  python backtest.py
+Run live:            python bot.py
 """
 
-from blankly import Binance, Strategy, StrategyState
-from blankly.utils import trunc
-from blankly.indicators import rsi
+import json
+import time
+import logging
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+import pandas as pd
 
-def init(symbol, state: StrategyState):
-    state.variables['history'] = state.interface.history(symbol, to=150, 
-        resolution=state.resolution, 
-        return_as='deque')['close']
-    state.variables['owns_position'] = False
+SYMBOL = "BTCUSDT"
+RSI_PERIOD = 14
+RSI_BUY = 28
+RSI_SELL = 72
+POSITION_SIZE = 0.25
+STOP_LOSS_PCT = 0.05
+MIN_NOTIONAL = 10.0  # Binance minimum order in USDT
+CHECK_INTERVAL = 3600  # 1 hour in seconds
 
-def rsi_price_event(price, symbol, state: StrategyState):
-    state.variables['history'].append(price) # appends to the deque of historical prices
-    rsi_output = rsi(state.variables['history'])
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+log = logging.getLogger(__name__)
 
-    if rsi_output[-1] < 30 and not state.variables['owns_position']:
-        qty = trunc(state.interface.cash * 0.5 / price, 2)
-        state.interface.market_order(symbol, side='buy', size=qty)
-        state.variables['owns_position'] = True
-    elif rsi_output[-1] > 70 and state.variables['owns_position']:
-        # get the amount of bitcoin we have in our account
-        curr_value = trunc(state.interface.account[state.base_asset].available, 2)
-        state.interface.market_order(symbol, side='sell', size=curr_value)
-        state.variables['owns_position'] = False
-    
-exchange = Binance()
-strategy = Strategy(exchange)
 
-strategy.add_price_event(rsi_price_event, symbol='BTC-USDT', resolution='1h', init=init)
-strategy.add_price_event(rsi_price_event, symbol='ETH-USDT', resolution='1h', init=init)
+def load_client():
+    with open("keys.json") as f:
+        keys = json.load(f)
+    creds = list(keys["binance"].values())[0]
+    return Client(creds["API_KEY"], creds["API_SECRET"])
 
-results = strategy.backtest(to='2y', initial_values={'USDT': 10000})
-print(results)
 
-# Take this strategy live by uncommenting this line
-# strategy.start()
+def compute_rsi(closes, period=14):
+    delta = closes.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def get_rsi_and_price(client):
+    klines = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_1HOUR, limit=100)
+    closes = pd.Series([float(k[4]) for k in klines])
+    rsi_series = compute_rsi(closes, RSI_PERIOD)
+    return float(rsi_series.iloc[-1]), float(klines[-1][4])
+
+
+def get_balance(client, asset):
+    return float(client.get_asset_balance(asset=asset)["free"])
+
+
+def run():
+    client = load_client()
+    owns_position = False
+    buy_price = None
+
+    log.info("Bot started — %s | RSI buy<%d sell>%d | stop-loss %.0f%% | position %.0f%%",
+             SYMBOL, RSI_BUY, RSI_SELL, STOP_LOSS_PCT * 100, POSITION_SIZE * 100)
+
+    while True:
+        try:
+            rsi_value, price = get_rsi_and_price(client)
+            log.info("Price=$%.2f  RSI=%.1f  position=%s", price, rsi_value, "OPEN" if owns_position else "NONE")
+
+            # Stop-loss check
+            if owns_position and buy_price and price <= buy_price * (1 - STOP_LOSS_PCT):
+                btc = get_balance(client, "BTC")
+                qty = round(btc, 5)
+                if qty > 0:
+                    client.order_market_sell(symbol=SYMBOL, quantity=qty)
+                    log.warning("STOP-LOSS — sold %.5f BTC at $%.2f (entry $%.2f, loss %.1f%%)",
+                                qty, price, buy_price, (buy_price - price) / buy_price * 100)
+                owns_position = False
+                buy_price = None
+
+            # Buy signal
+            elif rsi_value < RSI_BUY and not owns_position:
+                usdt = get_balance(client, "USDT")
+                spend = usdt * POSITION_SIZE
+                if spend >= MIN_NOTIONAL:
+                    qty = round(spend / price, 5)
+                    client.order_market_buy(symbol=SYMBOL, quantity=qty)
+                    owns_position = True
+                    buy_price = price
+                    log.info("BUY  %.5f BTC at $%.2f (RSI=%.1f, spent $%.2f)", qty, price, rsi_value, spend)
+                else:
+                    log.warning("Buy signal but balance too low ($%.2f < $%.2f min)", spend, MIN_NOTIONAL)
+
+            # Sell signal
+            elif rsi_value > RSI_SELL and owns_position:
+                btc = get_balance(client, "BTC")
+                qty = round(btc, 5)
+                if qty > 0:
+                    client.order_market_sell(symbol=SYMBOL, quantity=qty)
+                    pnl = qty * (price - buy_price)
+                    log.info("SELL %.5f BTC at $%.2f (RSI=%.1f, P&L %+.2f)", qty, price, rsi_value, pnl)
+                owns_position = False
+                buy_price = None
+
+        except BinanceAPIException as e:
+            log.error("Binance API error: %s", e)
+        except Exception as e:
+            log.error("Unexpected error: %s", e)
+
+        time.sleep(CHECK_INTERVAL)
+
+
+if __name__ == "__main__":
+    run()

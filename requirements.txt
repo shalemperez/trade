@@ -1,1 +1,2 @@
-blankly
+python-binance>=1.0.15
+pandas>=1.3.0

@@ -11,7 +11,7 @@
     },
     "binance": {
       "cash": "USDT",
-      "binance_tld": "us"
+      "binance_tld": "com"
     },
     "alpaca": {
       "websocket_stream": "iex",
